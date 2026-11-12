@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<!-- Blocks pinch/double-tap zoom so rapid taps never zoom the page on phones -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Typing Defender</title>
+<style>
+/* ===== 1. THEME TOKENS: every neon colour lives here, so the look is easy to change ===== */
+:root {
+  --bg: #070614;          /* deep space */
+  --cyan: #19f0ff;        /* words */
+  --magenta: #ff2bd6;     /* locked target */
+  --green: #39ff88;       /* correctly typed letters */
+  --red: #ff3355;         /* damage */
+  --font: ui-monospace, "SF Mono", Consolas, "Courier New", monospace;
+}
+* { box-sizing: border-box; }
+
+/* Lock the page: no scrolling, no text selection, no pull-to-refresh */
+html, body {
+  margin: 0; height: 100%; overflow: hidden; background: var(--bg);
+  overscroll-behavior: none; user-select: none; -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+  font-family: var(--font); color: #d8f6ff;
+}
+
+/* ===== 2. GAME CONTAINER =====
+   100dvh = "dynamic viewport height": shrinks when the mobile keyboard opens.
+   JS (resize()) also sets the exact height from visualViewport as a fallback for older browsers. */
+#game {
+  position: fixed; left: 0; top: 0; width: 100%;
+  height: 100vh; height: 100dvh; overflow: hidden;
+  background:
+    radial-gradient(ellipse at 50% 110%, rgba(255,43,214,.25), transparent 60%),
+    radial-gradient(ellipse at 50% -20%, rgba(25,240,255,.18), transparent 55%),
+    var(--bg);
+}
+/* Slowly scrolling neon grid = sense of falling through space */
+#game::before {
+  content: ""; position: absolute; inset: 0; opacity: .35;
+  background-image:
+    linear-gradient(rgba(25,240,255,.18) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(25,240,255,.18) 1px, transparent 1px);
+  background-size: 48px 48px; animation: grid 6s linear infinite;
+}
+@keyframes grid { to { background-position: 0 48px; } }
+/* Faint CRT scanlines over everything for the cyberpunk feel */
+#game::after {
+  content: ""; position: absolute; inset: 0; z-index: 7; pointer-events: none;
+  background: repeating-linear-gradient(transparent 0 2px, rgba(0,0,0,.18) 2px 3px);
+}
+
+/* The arena is where words fall. Everything inside is positioned with transform. */
+#arena { position: absolute; inset: 0; z-index: 2; }   /* words draw above the mascot */
+
+/* ===== 3. HUD ===== */
+#hud {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 5; pointer-events: none;
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; font-size: clamp(14px, 3.6vw, 20px); font-weight: 700;
+  background: linear-gradient(rgba(7,6,20,.85), transparent);
+}
+#hud b { color: var(--cyan); text-shadow: 0 0 10px var(--cyan); }
+#lives span { color: var(--red); text-shadow: 0 0 10px var(--red); margin-left: 4px; transition: opacity .3s; }
+#lives span.lost { opacity: .15; text-shadow: none; }
+
+/* ===== 4. WORDS ===== */
+/* .word handles POSITION (JS moves it). .chip handles LOOK, so animations never fight the position. */
+.word { position: absolute; left: 0; top: 0; white-space: nowrap; will-change: transform; }
+.chip {
+  position: relative; padding: 5px 12px; border-radius: 10px 10px 4px 4px;
+  font-size: clamp(16px, 4.4vw, 22px); font-weight: 800; letter-spacing: .12em;
+  color: #c9fbff; background: rgba(8,20,40,.75);
+  border: 1.5px solid var(--cyan); box-shadow: 0 0 12px rgba(25,240,255,.55), inset 0 0 8px rgba(25,240,255,.25);
+  transition: border-color .15s, box-shadow .15s, background .15s;
+}
+/* Glowing trail above each word, like a falling meteor */
+.chip::before {
+  content: ""; position: absolute; left: 50%; bottom: 100%; width: 3px; height: 26px;
+  transform: translateX(-50%); background: linear-gradient(transparent, var(--cyan)); opacity: .7;
+}
+.chip span { display: inline-block; }
+.chip span.hit { color: var(--green); text-shadow: 0 0 10px var(--green); }   /* typed letters turn green */
+.chip.locked { border-color: var(--magenta); box-shadow: 0 0 18px var(--magenta), inset 0 0 10px rgba(255,43,214,.4); }
+.chip.locked::before { background: linear-gradient(transparent, var(--magenta)); }
+.chip.wrong { border-color: var(--red); box-shadow: 0 0 24px var(--red), inset 0 0 12px rgba(255,51,85,.5); animation: nudge .3s; }   /* angry: shakes and glows red */
+.chip.joy { animation: chipjoy .25s ease-out; }                                                                                  /* happy: pops with a green glow */
+@keyframes chipjoy { 40% { transform: scale(1.18); box-shadow: 0 0 26px var(--green); } }
+@keyframes nudge { 20% { translate: -8px 0; } 40% { translate: 8px 0; } 60% { translate: -6px 0; } 80% { translate: 6px 0; } }
+
+/* Destroyed word: box fades, each letter flies apart (--dx, --dy, --rot are set by JS) */
+.chip.dead { background: transparent; border-color: transparent; box-shadow: none; }
+.chip.dead::before { opacity: 0; }
+.chip.dead span { animation: frag .6s ease-out forwards; }
+@keyframes frag {
+  to { transform: translate(var(--dx), var(--dy)) rotate(var(--rot)) scale(.2); opacity: 0; color: var(--magenta); }
+}
+
+/* Mascot: sits behind the words just above the shield and reacts to every key you press */
+#buddy { position: absolute; left: 0; right: 0; bottom: 26px; z-index: 1; text-align: center; pointer-events: none; opacity: .9; }
+#face { display: inline-block; font-size: clamp(34px, 9vw, 54px); filter: drop-shadow(0 0 12px var(--cyan)); }
+#face.happy { animation: joy .5s ease-out; filter: drop-shadow(0 0 16px var(--green)); }
+#face.angry { animation: rage .5s; filter: drop-shadow(0 0 16px var(--red)); }
+@keyframes joy  { 30% { transform: translateY(-18px) scale(1.3) rotate(-8deg); } 60% { transform: translateY(0) scale(1.1) rotate(8deg); } }
+@keyframes rage { 15% { transform: translateX(-9px) scale(1.25); } 35% { transform: translateX(9px) scale(1.25); }
+                  55% { transform: translateX(-7px) scale(1.2); } 75% { transform: translateX(7px) scale(1.2); } }
+
+/* Floating "+points" popup that rises from a destroyed word */
+.pop { position: absolute; font-weight: 800; pointer-events: none; color: var(--green); text-shadow: 0 0 8px var(--green); animation: rise .8s ease-out forwards; }
+@keyframes rise { to { transform: translateY(-46px); opacity: 0; } }
+
+/* Explosion sparks */
+.spark {
+  position: absolute; left: 0; top: 0; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--c); box-shadow: 0 0 10px var(--c); animation: burst .6s ease-out forwards;
+}
+@keyframes burst { to { transform: translate(var(--dx), var(--dy)) scale(0); opacity: 0; } }
+
+/* ===== 5. SHIELD + DAMAGE FEEDBACK ===== */
+#shield {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 16px; z-index: 4;
+  background: linear-gradient(90deg, var(--cyan), var(--magenta), var(--cyan));
+  box-shadow: 0 -4px 22px var(--cyan), 0 -10px 40px rgba(255,43,214,.5);
+}
+#shield { animation: pulse 2s ease-in-out infinite; }   /* the shield breathes */
+@keyframes pulse { 50% { filter: brightness(1.35); } }
+#flash { position: absolute; inset: 0; z-index: 6; pointer-events: none; background: var(--red); opacity: 0; }
+#flash.on { animation: flash .45s ease-out; }
+@keyframes flash { from { opacity: .55; } to { opacity: 0; } }
+#game.shake { animation: shake .4s; }
+@keyframes shake {
+  20% { transform: translate(-9px, 5px); } 40% { transform: translate(8px, -6px); }
+  60% { transform: translate(-6px, -3px); } 80% { transform: translate(5px, 4px); }
+}
+
+/* ===== 6. OVERLAYS (start screen + game over modal) ===== */
+.overlay {
+  position: absolute; inset: 0; z-index: 10; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; justify-content: safe center; gap: 14px; padding: 24px; text-align: center; overflow-y: auto;
+  background: rgba(7,6,20,.88); backdrop-filter: blur(4px);
+}
+.overlay.hidden { display: none; }
+h1 {
+  margin: 0; font-size: clamp(30px, 9vw, 64px); letter-spacing: .08em; color: #fff;
+  text-shadow: 0 0 12px var(--cyan), 0 0 32px var(--cyan), 0 0 60px var(--magenta);
+}
+h2 { margin: 0; font-size: clamp(26px, 7vw, 44px); color: var(--red); text-shadow: 0 0 18px var(--red); }
+.overlay p { margin: 0; max-width: 34ch; line-height: 1.5; font-size: clamp(14px, 3.8vw, 18px); color: #aeeaf5; }
+.overlay .score-line { font-size: clamp(20px, 5vw, 28px); color: var(--green); text-shadow: 0 0 10px var(--green); }
+button {
+  font: inherit; font-weight: 800; letter-spacing: .1em; font-size: clamp(16px, 4.4vw, 20px);
+  padding: 14px 34px; margin-top: 8px; cursor: pointer; color: #fff; background: transparent;
+  border: 2px solid var(--cyan); border-radius: 10px; box-shadow: 0 0 16px var(--cyan), inset 0 0 12px rgba(25,240,255,.3);
+  transition: transform .12s, background .12s;
+}
+button:hover, button:focus-visible { background: rgba(25,240,255,.18); transform: scale(1.05); outline: none; }
+
+/* ===== 7. HIDDEN INPUT: invisible, but a real focusable text field so phones show their keyboard =====
+   font-size 16px stops iOS from auto-zooming when the input is focused. Not display:none (that cannot be focused). */
+#hidden-input {
+  position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; padding: 0; border: 0;
+  opacity: 0; font-size: 16px; pointer-events: none;
+}
+
+/* Mode and level pickers on the start screen */
+.group { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+.opt { margin: 0; padding: 10px 14px; font-size: clamp(12px, 3.4vw, 15px); border-color: #3a4a6a; box-shadow: none; color: #9fc3d6; }
+.opt.sel { color: #fff; border-color: var(--cyan); box-shadow: 0 0 14px var(--cyan), inset 0 0 10px rgba(25,240,255,.3); }
+.opt[data-level="veryhard"].sel { border-color: var(--red); box-shadow: 0 0 14px var(--red), inset 0 0 10px rgba(255,51,85,.35); }
+#level-desc { min-height: 3em; }
+/* Very Hard turns the whole grid red */
+#game[data-level="veryhard"]::before {
+  background-image: linear-gradient(rgba(255,51,85,.25) 1px, transparent 1px), linear-gradient(90deg, rgba(255,51,85,.25) 1px, transparent 1px);
+}
+@media (max-height: 620px) { .overlay { gap: 8px; } h1 { font-size: 26px; } }
+
+/* Short play area (phone keyboard open): JS adds .compact / .tiny so everything shrinks and the words get more room */
+#game.compact #hud { padding: 4px 10px; font-size: 13px; }
+#game.compact .chip { font-size: 15px; padding: 3px 9px; }
+#game.compact .chip::before { height: 14px; }
+#game.compact #buddy { bottom: 14px; }
+#game.compact #face { font-size: 30px; }
+#game.tiny #buddy { display: none; }
+#game.tiny #hud { padding: 2px 10px; font-size: 12px; }
+#game.tiny .chip { font-size: 14px; padding: 2px 8px; }
+#rotate-hint {
+  display: none; position: absolute; top: 24px; left: 0; right: 0; z-index: 5; text-align: center;
+  font-size: 12px; color: #ffb21f; text-shadow: 0 0 8px #ffb21f; pointer-events: none;
+}
+#game.tiny.wide #rotate-hint { display: block; }   /* only when the phone is sideways AND the keyboard leaves very little room */
+
+/* Accessibility: calmer visuals for people who ask for reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  #game::before { animation: none; } #game.shake { animation: none; } #shield { animation: none; }
+}
+
+/* ===== TAMBAHAN: kata spesial, freeze, menu baru ===== */
+.chip[data-kind]::after { position: absolute; top: -13px; right: -7px; font-size: 15px; }
+.chip[data-kind="gold"]::after  { content: "\2605"; color: #ffd23f; text-shadow: 0 0 8px #ffd23f; }
+.chip[data-kind="virus"]::after { content: "\2623"; color: var(--red); text-shadow: 0 0 8px var(--red); }
+.chip[data-kind="bomb"]::after  { content: "\1F4A3"; }
+.chip.dead::after { opacity: 0; }
+.chip[data-kind="gold"]:not(.locked):not(.dead):not(.wrong)  { border-color: #ffd23f; box-shadow: 0 0 16px #ffd23f, inset 0 0 8px rgba(255,210,63,.3); }
+.chip[data-kind="virus"]:not(.locked):not(.dead):not(.wrong) { border-color: var(--red); box-shadow: 0 0 16px var(--red), inset 0 0 8px rgba(255,51,85,.35); }
+.chip[data-kind="bomb"]:not(.locked):not(.dead):not(.wrong)  { border-color: #ffb21f; box-shadow: 0 0 16px #ffb21f, inset 0 0 8px rgba(255,178,31,.3); }
+#game.frozen { box-shadow: inset 0 0 70px rgba(25,240,255,.7); }
+#game.frozen::before { animation-play-state: paused; }
+.mini { margin: 0; padding: 8px 14px; font-size: clamp(12px, 3.4vw, 14px); border-color: #3a4a6a; box-shadow: none; color: #9fc3d6; }
+#stat-body { display: grid; gap: 6px; }
+.small-title { font-size: clamp(24px, 7vw, 40px); }
+#snd-btn { position: absolute; top: 44px; right: 10px; z-index: 8; margin: 0; padding: 6px 10px; font-size: 16px; border-radius: 8px; opacity: .85; box-shadow: none; border-color: #3a4a6a; }
+</style>
+</head>
+<body>
+
+<div id="game">
+  <div id="buddy"><span id="face">😎</span></div>   <!-- mascot face -->
+  <div id="arena"></div>               <!-- falling words are added here by JS -->
+  <div id="shield"></div>              <!-- the bottom boundary the player defends -->
+  <div id="flash"></div>               <!-- red flash when a word breaks through -->
+
+  <div id="hud">
+    <div>SKOR <b id="score">0</b></div>
+    <div>WPM <b id="wpm">0</b></div>
+    <div>COMBO <b id="combo">x1</b></div>
+    <div id="lives"></div>
+  </div>
+
+  <button id="snd-btn" aria-label="Musik hidup atau mati">&#9835;</button>
+  <div id="rotate-hint">Putar HP jadi berdiri (portrait) supaya layarnya lebih luas</div>
+
+  <!-- Start screen: just pick a level and start -->
+  <div id="start-screen" class="overlay">
+    <h1>TYPING<br>DEFENDER</h1>
+    <p>Latihan mengetik cepat. Ketik kata yang jatuh sebelum mendarat di perisai.</p>
+    <div class="group">
+      <button class="opt sel" data-level="normal">BIASA</button>
+      <button class="opt" data-level="hard">HARD</button>
+      <button class="opt" data-level="veryhard">VERY HARD</button>
+    </div>
+    <p id="level-desc"></p>
+    <p>Kategori kata</p>
+    <div class="group">
+      <button class="opt sel" data-cat="umum">UMUM</button>
+      <button class="opt" data-cat="inggris">ENGLISH</button>
+    </div>
+    <p>Di HP, ketuk layar di mana saja untuk memunculkan keyboard.</p>
+    <button id="start-btn">MULAI</button>
+    <div class="group">
+      <button class="mini" id="how-btn">CARA MAIN</button>
+      <button class="mini" id="stat-btn">STATISTIK</button>
+      <button class="mini" id="mus-btn">MUSIK: ON</button>
+      <button class="mini" id="sfx-btn">EFEK: ON</button>
+    </div>
+  </div>
+
+  <!-- Game over modal -->
+  <div id="game-over" class="overlay hidden">
+    <h2>PERISAI JEBOL</h2>
+    <div class="score-line">Skor <span id="final-score">0</span></div>
+    <p id="run-label"></p>
+    <p>Kecepatan <span id="final-wpm">0</span> WPM, akurasi <span id="final-acc">100</span>%</p>
+    <p>Skor terbaik: <span id="best-score">0</span></p>
+    <button id="restart-btn">MAIN LAGI</button>
+    <button id="menu-btn">GANTI LEVEL</button>
+  </div>
+
+  <!-- TAMBAHAN: layar Cara Main -->
+  <div id="howto" class="overlay hidden">
+    <h1 class="small-title">CARA MAIN</h1>
+    <p>Ketik kata yang jatuh sebelum mendarat di perisai. Salah huruf memutus kombo.</p>
+    <p>&#9733; Emas: +1 nyawa dan +50 skor.<br>&#9763; Virus: JANGAN diketik, biarkan jatuh. Kalau diketik, nyawa berkurang 1.<br>&#128163; Bom: menghancurkan semua kata di layar.<br>&#10052; Kombo 10 kata: layar membeku 3 detik.</p>
+    <p>Kata spesial muncul setelah skor 100.</p>
+    <button data-close>KEMBALI</button>
+  </div>
+
+  <!-- TAMBAHAN: layar Statistik -->
+  <div id="stats" class="overlay hidden">
+    <h1 class="small-title">STATISTIK</h1>
+    <div id="stat-body"></div>
+    <button data-close>KEMBALI</button>
+  </div>
+</div>
+
+<!-- The key trick for mobile: typing into this invisible field opens the on-screen keyboard -->
+<input type="text" id="hidden-input" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" aria-label="Type here to play">
+
+<script>
+(() => {
+'use strict';
+
+/* ===== 1. DATA: Indonesian words (3 to 8 letters, lowercase) ===== */
+const INDO = [
+  "kode", "bahasa", "belajar", "sekolah", "pelajar", "guru", "tugas", "ujian", "cepat", "tangkas", "jagoan",
+  "hebat", "semangat", "pahlawan", "merdeka", "garuda", "bintang", "angkasa", "perisai", "tembak", "ketik",
+  "sandi", "jaringan", "laptop", "kereta", "bangsa", "negeri", "maju", "kuat", "berani", "cerdas", "kreatif",
+  "pintar", "layar", "huruf", "kata", "ledakan", "musuh", "komputer", "program", "variabel", "tampilan",
+  "pesawat", "gerakan", "jawaban", "internet", "rumah", "jalan", "pasar", "sawah", "kebun", "gunung",
+  "pantai", "sungai", "danau", "hutan", "pulau", "laut", "langit", "bulan", "matahari", "awan", "hujan",
+  "angin", "petir", "banjir", "api", "air", "tanah", "batu", "kayu", "bambu", "kelapa", "pisang", "mangga",
+  "durian", "jeruk", "apel", "nanas", "salak", "semangka", "singkong", "tempe", "tahu", "nasi", "bakso",
+  "sate", "soto", "rendang", "gudeg", "gado", "kopi", "susu", "gula", "garam", "sambal", "cabai", "bawang",
+  "ikan", "ayam", "bebek", "kucing", "anjing", "kuda", "sapi", "kerbau", "harimau", "gajah", "monyet",
+  "burung", "elang", "rusa", "kancil", "buaya", "ular", "kupu", "lebah", "semut", "nyamuk", "teman",
+  "sahabat", "keluarga", "ibu", "bapak", "kakak", "adik", "nenek", "kakek", "paman", "bibi", "murid", "siswa",
+  "kelas", "buku", "pensil", "tas", "meja", "kursi", "papan", "spidol", "kapur", "nilai", "rapor", "juara",
+  "lomba", "tanding", "bola", "voli", "renang", "lari", "senam", "silat", "catur", "gambar", "lukis", "musik",
+  "lagu", "nada", "gitar", "drum", "suling", "angklung", "gamelan", "wayang", "batik", "tari", "keris",
+  "candi", "merah", "putih", "biru", "hijau", "kuning", "hitam", "abu", "ungu", "jingga", "besar", "kecil",
+  "tinggi", "rendah", "panjang", "pendek", "lambat", "baru", "lama", "indah", "cantik", "tampan", "ramah",
+  "sopan", "jujur", "rajin", "malas", "sabar", "ceria", "bahagia", "sedih", "marah", "takut", "kaget",
+  "lapar", "haus", "ngantuk", "sehat", "sakit", "sibuk", "santai", "mudah", "sulit", "aman", "bahaya",
+  "damai", "perang", "kemarin", "besok", "pagi", "siang", "sore", "malam", "minggu", "tahun", "detik",
+  "menit", "jam", "waktu", "mulai", "selesai", "lanjut", "henti", "ulang", "coba", "gagal", "menang", "kalah",
+  "seri", "hadiah", "terbang", "lompat", "geser", "putar", "tekan", "klik", "pilih", "hapus", "simpan",
+  "kirim", "terima", "buka", "tutup", "nyala", "mati", "hidup", "tunggu", "cari", "temukan", "hitung",
+  "tulis", "baca", "dengar", "lihat", "bicara", "nyanyi", "main", "kerja", "tidur", "makan", "minum", "mandi",
+  "duduk", "berdiri", "tertawa", "senyum", "peluk", "tolong", "selamat", "maaf", "silakan", "permisi",
+  "mantap", "keren", "asyik", "seru", "peladen", "gawai", "surel", "unduh", "unggah", "pranala", "tetikus",
+  "pindai", "cetak", "berkas", "aplikasi", "mesin", "robot", "sinyal", "kabel", "baterai", "listrik",
+  "cahaya", "bumi", "planet", "galaksi", "komet", "roket", "satelit", "jakarta", "bandung", "medan", "bali",
+  "lombok", "papua", "jawa", "sumatera", "sulawesi", "madura", "aceh", "riau", "bogor", "malang", "solo",
+  "padang", "manado", "ambon", "batam", "tegal"];
+const WORDS = INDO.map(t => ({ t }));   // each entry is {t: text}
+
+/* TAMBAHAN: kategori kata. "umum" memakai daftar kata asli di atas. */
+const EN = ["sun","moon","star","book","bird","fish","tree","rain","wind","fire","cake","game","blue","gold","home","love","time","hand","door","road","ship","city","food","milk","rice","desk","farm","class","pen","bag","map","sea","sky","song","dance","paint","plant","water","earth","cloud","storm","river","ocean","beach","house","learn","write","speak","listen","answer","number","letter","simple","jungle","happy","strong","quick","brave","smart","green","yellow","purple","orange","silver","school","teacher","student","library","science","history","english","machine","network","energy","future","bridge","planet","garden","window","market","family","friend","morning","evening","weekend","holiday","kitchen","mountain","village","country","monkey","rabbit","turtle","dolphin","penguin","tiger","horse","pencil","bottle","basket","pocket","button","mirror","ticket","camera","guitar","piano","music","movie","story","dream","hero","travel","flight","island","forest","desert","valley","sunrise","sunset","rainbow","thunder","journey","freedom","courage"];
+const CATS = { umum: null, inggris: EN.map(t => ({ t })) };
+let cat = 'umum';
+
+/* ===== LEVEL SETTINGS: every difficulty is just a set of numbers =====
+   lives: starting lives | speed0/speedGain/speedMax: fall speed (screen heights per second, grows with score)
+   gap: pause between words (ms) | active: score where 2 and 3 words may share the screen
+   lenMin/lenStart/lenCap: allowed word length | mult: score multiplier */
+const LEVELS = {
+  normal:   { name: 'Biasa',     lives: 5, speed0: 0.07, speedGain: 0.00006, speedMax: 0.20, gap: 900, active: [1500, 3000], lenMin: 3, lenStart: 4, lenCap: 6, mult: 1 },
+  hard:     { name: 'Hard',      lives: 3, speed0: 0.10, speedGain: 0.00010, speedMax: 0.32, gap: 650, active: [500, 1500],   lenMin: 4, lenStart: 5, lenCap: 7, mult: 1.5 },
+  veryhard: { name: 'Very Hard', lives: 2, speed0: 0.15, speedGain: 0.00018, speedMax: 0.45, gap: 350, active: [0, 300],      lenMin: 5, lenStart: 6, lenCap: 8, mult: 2 }
+};
+
+/* ===== 2. ELEMENTS + GAME STATE ===== */
+const $ = id => document.getElementById(id);
+const game = $('game'), arena = $('arena'), input = $('hidden-input'), flash = $('flash');
+const scoreEl = $('score'), wpmEl = $('wpm'), comboEl = $('combo'), livesEl = $('lives');
+const startScreen = $('start-screen'), overScreen = $('game-over');
+
+const SHIELD_H = 16;          // must match #shield height in CSS
+let MAX_LIVES = 3;          // set from the chosen level when the game starts
+let state = 'menu';           // 'menu' | 'playing' | 'over'
+let words = [];               // every word currently falling
+let target = null;            // the word the player is typing (locked on)
+let score = 0, lives = MAX_LIVES, best = 0;
+let lastTime = 0, spawnTimer = 0;
+let level = 'normal';                                  // chosen on the start screen: 'normal' | 'hard' | 'veryhard'
+let combo = 0, correct = 0, wrong = 0, playStart = 0;   // combo streak + typing stats for WPM and accuracy
+let areaW = 0, areaH = 0;     // size of the play area in pixels
+let freezeUntil = 0, killedRun = 0;   // TAMBAHAN: waktu freeze berakhir + jumlah kata hancur di ronde ini
+
+const bestKey = () => `typingDefenderBest-${level}`;   // a separate high score for every level
+   // saved high score (may be blocked)
+
+/* ===== 3. RESPONSIVE SIZING (keyboard-safe) =====
+   When the phone keyboard opens, visualViewport.height shrinks to the visible part of the screen.
+   We resize the game to that height, so the shield always stays above the keyboard. */
+function resize() {
+  const vv = window.visualViewport;
+  game.style.height = (vv ? vv.height : window.innerHeight) + 'px';
+  game.style.top = (vv ? vv.offsetTop : 0) + 'px';
+  window.scrollTo(0, 0);                       // stop iOS from scrolling the page when the keyboard opens
+  areaW = arena.clientWidth; areaH = arena.clientHeight;
+  game.classList.toggle('compact', areaH < 380);        // keyboard open on a small screen: shrink the UI
+  game.classList.toggle('tiny', areaH < 260);           // very little room left: shrink more and hide the mascot
+  game.classList.toggle('wide', areaW > areaH);         // sideways phone
+  for (const w of words) {                     // keep words inside the new width
+    w.x = Math.min(w.x, Math.max(0, areaW - w.width - 8)); place(w);
+  }
+}
+window.addEventListener('resize', resize);
+if (window.visualViewport) {
+  visualViewport.addEventListener('resize', resize);
+  visualViewport.addEventListener('scroll', resize);
+}
+
+/* ===== 4. DIFFICULTY: everything grows with the score ===== */
+function difficulty() {
+  const L = LEVELS[level];
+  return {
+    interval: Math.max(250, L.gap - score * 0.3),                          // pause (ms) between words
+    maxActive: score < L.active[0] ? 1 : score < L.active[1] ? 2 : 3,      // how many words may be on screen at once
+    speed: areaH * Math.min(L.speedMax, L.speed0 + score * L.speedGain),   // fall speed in px per second (scaled to screen height)
+    minLen: L.lenMin,
+    maxLen: Math.min(L.lenCap, L.lenStart + Math.floor(score / 120)),      // longer words appear as the score grows
+    level: 1 + Math.floor(score / 200)
+  };
+}
+
+/* ===== 5. SPAWNING ===== */
+const recent = [];   // words used lately, so the same ones do not keep coming back
+function pickWord() {
+  const d = difficulty();
+  const usedLetters = words.map(w => w.text[0]);          // first letters already on screen
+  const src = CATS[cat] || WORDS;
+  let pool = src.filter(o => o.t.length >= d.minLen && o.t.length <= d.maxLen);
+  if (!pool.length) pool = src.filter(o => o.t.length >= d.minLen);   // kategori tetap dipakai walau melewati batas panjang
+  if (!pool.length) pool = src;   // only words in the length range of this level
+  // 1) Skip the words used most recently (the last half of the pool), so the game stays fresh
+  const old = recent.slice(-Math.floor(pool.length / 2));
+  const notRecent = pool.filter(o => !old.includes(o.t));
+  if (notRecent.length) pool = notRecent;
+  // 2) Avoid a first letter that is already on screen, so targeting is never ambiguous
+  const fresh = pool.filter(o => !usedLetters.includes(o.t[0]));
+  if (fresh.length) pool = fresh;
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  recent.push(pick.t); if (recent.length > 400) recent.shift();
+  return pick;
+}
+
+function spawnWord() {
+  const pick = pickWord(), text = pick.t;
+  const el = document.createElement('div'); el.className = 'word';
+  const chip = document.createElement('div'); chip.className = 'chip';
+  const kind = pickKind(); if (kind) chip.dataset.kind = kind;   // TAMBAHAN: kata spesial
+  // One <span> per letter so we can colour typed letters individually
+  const spans = [...text].map(ch => {
+    const s = document.createElement('span'); s.textContent = ch; chip.appendChild(s); return s;
+  });
+  el.appendChild(chip); arena.appendChild(el);
+
+  const width = el.offsetWidth, height = el.offsetHeight;
+  const w = {
+    el, chip, spans, text, kind, typed: 0, width, height,
+    x: 8 + Math.random() * Math.max(0, areaW - width - 16),   // random horizontal position
+    y: -height - 26,                                          // start just above the screen
+    speedMul: 0.85 + Math.random() * 0.3                      // each word falls slightly differently
+  };
+  words.push(w); place(w);
+}
+
+// Move the DOM element to the word's x/y (transform is smoother than left/top)
+function place(w) { w.el.style.transform = `translate3d(${w.x}px,${w.y}px,0)`; }
+
+/* ===== 6. MAIN LOOP (runs about 60 times per second) ===== */
+function loop(now) {
+  if (state !== 'playing') return;
+  const dt = (now < freezeUntil ? 0 : 1) * Math.min((now - lastTime) / 1000, 0.05);   // seconds since last frame (capped so tab-switching cannot teleport words)
+  lastTime = now;
+  const d = difficulty();
+
+  if (words.length < d.maxActive) spawnTimer -= dt * 1000;   // the pause only counts down while there is room for a new word
+  if (spawnTimer <= 0 && words.length < d.maxActive) { spawnWord(); spawnTimer = d.interval; }
+
+  const shieldY = areaH - SHIELD_H;
+  for (let i = words.length - 1; i >= 0; i--) {         // backwards, so removing items is safe
+    const w = words[i];
+    w.y += d.speed * w.speedMul * dt;
+    place(w);
+    if (w.y + w.height >= shieldY) {                    // reached the shield
+      hitShield(w);
+      if (state !== 'playing') return;
+    }
+  }
+  const mins = (now - playStart) / 60000;
+  wpmEl.textContent = mins > 0.05 ? Math.round(correct / 5 / mins) : 0;   // standard WPM: 5 characters = 1 word
+  requestAnimationFrame(loop);
+}
+
+/* ===== 7. TYPING + TARGETING ===== */
+function handleChar(raw) {
+  if (state !== 'playing') return;
+  const ch = raw.toLowerCase();
+  if (!/^[a-z]$/.test(ch)) return;                      // ignore spaces, numbers, symbols
+
+  // Not locked yet? Lock the LOWEST word (closest to the shield) starting with this letter
+  if (!target) {
+    const matches = words.filter(w => w.text[0] === ch);
+    if (!matches.length) { miss(ch); wrong++; setCombo(0); mood('😠', 'angry'); return; }   // no word starts with this key
+    target = matches.reduce((a, b) => (b.y > a.y ? b : a));
+    target.chip.classList.add('locked');
+  }
+
+  if (target.text[target.typed] === ch) {               // correct letter
+    correct++; sfx('key');
+    mood('😄', 'happy'); retrigger(target.chip, 'joy');          // happy: face + word pop
+    target.spans[target.typed].classList.add('hit');
+    target.typed++;
+    if (target.typed === target.text.length) destroy(target);
+  } else {                                              // wrong letter: red wobble
+    miss(ch); wrong++; setCombo(0);                                // a mistake breaks the combo
+    const c = target.chip;
+    retrigger(c, 'wrong'); setTimeout(() => c.classList.remove('wrong'), 300);
+    mood('😠', 'angry');                                   // angry: face + word shakes red
+    if (navigator.vibrate) navigator.vibrate(40);                // short buzz on phones that support it
+  }
+}
+
+// Escape / Backspace: release the lock and reset typed letters
+function unlock() {
+  if (!target) return;
+  target.typed = 0;
+  target.spans.forEach(s => s.classList.remove('hit'));
+  target.chip.classList.remove('locked');
+  target = null;
+}
+
+/* ===== 8. DESTROY: explosion + score ===== */
+function destroy(w) {
+  if (w.kind === 'virus') {                             // virus tidak boleh diketik: kena penalti
+    words.splice(words.indexOf(w), 1); if (target === w) target = null; w.el.remove();
+    lives--; renderLives(); setCombo(0); mood('\u{1F621}', 'angry');
+    retrigger(game, 'shake'); retrigger(flash, 'on'); toast('VIRUS! -1 NYAWA', '#ff3355'); sfx('virus');
+    if (lives <= 0) gameOver();
+    return;
+  }
+  words.splice(words.indexOf(w), 1);
+  if (target === w) target = null;
+  setCombo(combo + 1); killedRun++; sfx('word'); special(w);
+  const gain = Math.round(w.text.length * 10 * multiplier() * LEVELS[level].mult);   // harder level = more points
+  score += gain;
+  mood('🤩', 'happy');                          // word destroyed: extra happy face                          // longer words are worth more
+  scoreEl.textContent = score;
+
+  w.chip.classList.add('dead');                         // box fades out
+  w.spans.forEach(s => {                                // each letter flies in a random direction
+    s.style.setProperty('--dx', (Math.random() * 120 - 60) + 'px');
+    s.style.setProperty('--dy', (Math.random() * 120 - 60) + 'px');
+    s.style.setProperty('--rot', (Math.random() * 360 - 180) + 'deg');
+  });
+  // Sparks burst from the centre of the word
+  const cx = w.x + w.width / 2, cy = w.y + w.height / 2;
+  const pop = document.createElement('div'); pop.className = 'pop'; pop.textContent = '+' + gain;
+  pop.style.left = cx + 'px'; pop.style.top = (cy - 30) + 'px';
+  pop.addEventListener('animationend', () => pop.remove()); arena.appendChild(pop);
+  const colors = ['#19f0ff', '#ff2bd6', '#39ff88'];
+  for (let i = 0; i < 14; i++) {
+    const p = document.createElement('div'); p.className = 'spark';
+    const angle = Math.random() * Math.PI * 2, dist = 40 + Math.random() * 70;
+    p.style.left = cx + 'px'; p.style.top = cy + 'px';
+    p.style.setProperty('--c', colors[i % 3]);
+    p.style.setProperty('--dx', Math.cos(angle) * dist + 'px');
+    p.style.setProperty('--dy', Math.sin(angle) * dist + 'px');
+    p.addEventListener('animationend', () => p.remove());
+    arena.appendChild(p);
+  }
+  setTimeout(() => w.el.remove(), 600);                 // remove the DOM node after the animation
+}
+
+/* ===== 9. DAMAGE: word reached the shield ===== */
+function hitShield(w) {
+  words.splice(words.indexOf(w), 1);
+  if (target === w) target = null;
+  w.el.remove();
+  if (w.kind === "virus") return;                       // virus dibiarkan jatuh = aman
+  lives--; renderLives(); setCombo(0); sfx('hit');
+  mood('😡', 'angry');
+  retrigger(game, 'shake'); retrigger(flash, 'on');     // screen shake + red flash
+  if (lives <= 0) gameOver();
+}
+
+// Mascot reaction: swap the face and replay its animation, then go back to the cool face
+const face = $('face'); let faceTimer;
+function mood(emoji, cls) {
+  face.textContent = emoji; face.className = ''; void face.offsetWidth; face.className = cls;
+  clearTimeout(faceTimer);
+  faceTimer = setTimeout(() => { face.textContent = '😎'; face.className = ''; }, 700);
+}
+
+// Combo: every 3 words in a row without a mistake raises the score multiplier (max x5)
+function multiplier() { return Math.min(5, 1 + Math.floor(combo / 3)); }
+function setCombo(n) {
+  combo = n; comboEl.textContent = 'x' + multiplier();
+  if (n > 0 && n % 10 === 0) {                           // TAMBAHAN: kombo 10 = freeze 3 detik
+    freezeUntil = performance.now() + 3000; game.classList.add('frozen');
+    setTimeout(() => game.classList.remove('frozen'), 3000); toast('FREEZE 3 DETIK', '#19f0ff'); sfx('freeze');
+  }
+}
+
+// Restart a CSS animation by removing and re-adding its class
+function retrigger(el, cls) { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); }
+
+function renderLives() {
+  livesEl.innerHTML = '';
+  for (let i = 0; i < MAX_LIVES; i++) {
+    const s = document.createElement('span'); s.textContent = '\u2665';
+    if (i >= lives) s.className = 'lost';
+    livesEl.appendChild(s);
+  }
+}
+
+/* ===== 10. GAME FLOW ===== */
+function startGame() {
+  if (state === 'playing') return;
+  arena.innerHTML = ''; words = []; target = null; freezeUntil = 0; killedRun = 0; game.classList.remove('frozen');
+  score = 0; MAX_LIVES = LEVELS[level].lives; lives = MAX_LIVES;
+  game.dataset.level = level;                           // lets CSS restyle the grid for Very Hard
+  try { best = +localStorage.getItem(bestKey()) || 0; } catch (e) { best = 0; }
+  scoreEl.textContent = 0; wpmEl.textContent = 0; renderLives();
+  correct = 0; wrong = 0; setCombo(0);
+  startScreen.classList.add('hidden'); overScreen.classList.add('hidden');
+  state = 'playing';
+  resize();
+  input.value = ''; input.focus();                      // must run inside the tap/click so phones open the keyboard
+  lastTime = performance.now(); playStart = lastTime; spawnTimer = 300;
+  audioInit(); musicStart();                            // TAMBAHAN: suara hanya boleh mulai setelah tap/klik
+  requestAnimationFrame(loop);
+}
+
+function gameOver() {
+  state = 'over'; saveStats(); musicStop(); sfx('over');
+  if (score > best) { best = score; try { localStorage.setItem(bestKey(), best); } catch (e) {} }
+  $('final-score').textContent = score; $('best-score').textContent = best;
+  $('run-label').textContent = 'Level: ' + LEVELS[level].name;
+  const mins = (performance.now() - playStart) / 60000, total = correct + wrong;
+  $('final-wpm').textContent = Math.round(correct / 5 / Math.max(mins, 0.05));
+  $('final-acc').textContent = total ? Math.round(correct / total * 100) : 100;
+  overScreen.classList.remove('hidden');
+  input.blur();                                         // hide the keyboard so the modal is fully visible
+}
+
+$('start-btn').addEventListener('click', startGame);
+$('restart-btn').addEventListener('click', startGame);
+
+/* ===== 11. INPUT HANDLING ===== */
+// Mobile AND desktop: letters typed into the hidden input arrive here. We read them, then empty the field.
+input.addEventListener('input', () => {
+  for (const ch of input.value) handleChar(ch);
+  input.value = '';
+});
+
+// Desktop: global keydown. If the hidden input has focus, the "input" event above handles letters,
+// so here we only read letters ourselves when focus was lost (prevents counting a key twice).
+document.addEventListener('keydown', e => {
+  if (state !== 'playing') { if (e.key === 'Enter') startGame(); return; }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === 'Escape' || e.key === 'Backspace') { unlock(); return; }
+  if (document.activeElement !== input && e.key.length === 1) { e.preventDefault(); handleChar(e.key); }
+});
+
+// Tap anywhere on the game to bring the keyboard back (touchend is what iOS needs to allow focus)
+function refocus() { if (state === 'playing') input.focus(); }
+game.addEventListener('touchend', refocus);
+game.addEventListener('click', refocus);
+input.addEventListener('blur', () => { if (state === 'playing') setTimeout(refocus, 0); });  // desktop safety net
+
+/* ===== 11b. START SCREEN: choose a level ===== */
+const DESCRIPTIONS = {
+  normal: 'Biasa: 5 nyawa, kata pendek, jatuhnya santai. Cocok buat pemanasan.',
+  hard: 'Hard: 3 nyawa, kata lebih panjang, jatuh lebih cepat.',
+  veryhard: 'Very Hard: 2 nyawa, kata panjang, jatuh ngebut, banyak kata sekaligus.'
+};
+function describe() { $('level-desc').textContent = DESCRIPTIONS[level]; }
+document.querySelectorAll('.opt').forEach(btn => btn.addEventListener('click', () => {
+  if (state === 'playing') return;
+  btn.parentElement.querySelectorAll('.opt').forEach(o => o.classList.remove('sel'));   // unselect the others in this group
+  btn.classList.add('sel');
+  if (btn.dataset.level) level = btn.dataset.level;
+  describe();
+}));
+// From the game over modal, go back to the start screen to pick another level
+$('menu-btn').addEventListener('click', () => {
+  overScreen.classList.add('hidden'); startScreen.classList.remove('hidden'); state = 'menu';
+});
+
+/* ===== 11c. TAMBAHAN: kata spesial, statistik, menu baru ===== */
+function pickKind() {                                     // muncul setelah skor 100
+  if (score < 100) return '';
+  const r = Math.random();
+  return r < .07 ? 'gold' : r < .13 ? 'virus' : r < .18 ? 'bomb' : '';
+}
+function toast(text, color) {                             // tulisan singkat di tengah layar
+  const p = document.createElement('div'); p.className = 'pop'; p.textContent = text;
+  p.style.cssText = `left:${Math.max(8, areaW / 2 - 80)}px;top:${areaH * 0.4}px;color:${color};text-shadow:0 0 8px ${color};font-size:18px`;
+  p.addEventListener('animationend', () => p.remove()); arena.appendChild(p);
+}
+function special(w) {                                     // efek saat kata spesial berhasil diketik
+  if (w.kind === 'gold') { score += 50; lives = Math.min(MAX_LIVES, lives + 1); renderLives(); toast('+1 NYAWA  +50', '#ffd23f'); sfx('gold'); }
+  else if (w.kind === 'bomb') { toast('BOOM!', '#ffb21f'); sfx('bomb'); [...words].forEach(o => { o.kind = ''; destroy(o); }); }
+}
+
+const SK = 'typingDefenderStats';
+let ST = null;
+try { ST = JSON.parse(localStorage.getItem(SK)); } catch (e) {}
+ST = ST || { games: 0, killed: 0, bestWpm: 0, missed: {} };
+function miss(ch) { ST.missed[ch] = (ST.missed[ch] || 0) + 1; sfx('wrong'); }
+function saveStats() {
+  const mins = (performance.now() - playStart) / 60000;
+  ST.games++; ST.killed += killedRun; ST.bestWpm = Math.max(ST.bestWpm, Math.round(correct / 5 / Math.max(mins, 0.05)));
+  try { localStorage.setItem(SK, JSON.stringify(ST)); } catch (e) {}
+  killedRun = 0;
+}
+function showStats() {
+  const top = Object.entries(ST.missed).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, v]) => k.toUpperCase() + ' (' + v + 'x)').join(', ') || '-';
+  const bk = l => { try { return +localStorage.getItem('typingDefenderBest-' + l) || 0; } catch (e) { return 0; } };
+  $('stat-body').innerHTML = `<p>Permainan: ${ST.games}</p><p>Kata dihancurkan: ${ST.killed}</p><p>WPM tertinggi: ${ST.bestWpm}</p><p>Huruf sering salah: ${top}</p><p>Skor terbaik: Biasa ${bk('normal')}, Hard ${bk('hard')}, Very Hard ${bk('veryhard')}</p>`;
+  $('stats').classList.remove('hidden');
+}
+$('how-btn').addEventListener('click', () => $('howto').classList.remove('hidden'));
+$('stat-btn').addEventListener('click', showStats);
+document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => b.closest('.overlay').classList.add('hidden')));
+document.querySelectorAll('[data-cat]').forEach(b => b.addEventListener('click', () => { cat = b.dataset.cat; }));
+
+/* ===== 11d. TAMBAHAN: SUARA (dibuat langsung dengan Web Audio, tanpa file audio) ===== */
+let AC = null, master, musicGain, sfxGain, musicOn = true, sfxOn = true, musicTimer = 0, step = 0, nextT = 0;
+try { musicOn = localStorage.getItem('tdMusic') !== '0'; sfxOn = localStorage.getItem('tdSfx') !== '0'; } catch (e) {}
+function audioInit() {                                    // dipanggil dari tap/klik MULAI (syarat browser HP)
+  if (!AC) {
+    const C = window.AudioContext || window.webkitAudioContext; if (!C) return;
+    AC = new C(); master = AC.createGain(); master.gain.value = .6; master.connect(AC.destination);
+    musicGain = AC.createGain(); musicGain.connect(master);
+    sfxGain = AC.createGain(); sfxGain.connect(master);
+    applyAudioPrefs();
+  }
+  if (AC.state === 'suspended') AC.resume();
+}
+function tone(f, t, dur, type, vol, dest, slideTo) {
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, t);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + .01); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(dest); o.start(t); o.stop(t + dur + .02);
+}
+function noise(t, dur, vol, dest) {
+  const n = AC.sampleRate * dur | 0, b = AC.createBuffer(1, n, AC.sampleRate), d = b.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const src = AC.createBufferSource(), g = AC.createGain(); src.buffer = b; g.gain.value = vol;
+  src.connect(g); g.connect(dest || sfxGain); src.start(t);
+}
+const midi = n => 440 * Math.pow(2, (n - 69) / 12);
+function sfx(k) {
+  if (!AC || !sfxOn) return;
+  const t = AC.currentTime;
+  if (k === 'key') tone(900 + Math.random() * 80, t, .05, 'square', .1, sfxGain);                         // huruf benar: tik
+  else if (k === 'wrong') tone(160, t, .18, 'sawtooth', .25, sfxGain, 90);                               // salah: dengung rendah
+  else if (k === 'word') { const b = 72 + Math.min(combo, 8); [0, 4, 7, 12].forEach((o, i) => tone(midi(b + o), t + i * .05, .14, 'triangle', .3, sfxGain)); }   // kata hancur: arpeggio, makin tinggi saat kombo naik
+  else if (k === 'hit') { tone(110, t, .35, 'sawtooth', .4, sfxGain, 40); noise(t, .25, .35); }         // perisai kena
+  else if (k === 'gold') [84, 88, 91, 96].forEach((n, i) => tone(midi(n), t + i * .07, .2, 'sine', .3, sfxGain));
+  else if (k === 'bomb') { noise(t, .7, .6); tone(90, t, .6, 'sawtooth', .4, sfxGain, 30); }
+  else if (k === 'virus') tone(220, t, .4, 'square', .25, sfxGain, 70);
+  else if (k === 'freeze') tone(1400, t, .6, 'sine', .3, sfxGain, 300);
+  else if (k === 'over') [67, 64, 60, 55].forEach((n, i) => tone(midi(n), t + i * .22, .3, 'triangle', .35, sfxGain));
+}
+
+// Musik latar: loop 2 birama (bass + arpeggio + hi-hat). Tempo naik di level yang lebih sulit.
+const BASS = [45,0,45,0,45,0,45,43, 41,0,41,0,41,0,41,43];
+const ARP  = [69,72,76,72, 69,72,76,81, 65,69,72,69, 65,69,72,77];
+function musicStart() {
+  if (!AC) return; musicStop(); step = 0; nextT = AC.currentTime + .1;
+  musicTimer = setInterval(() => {
+    const dt = 30 / ({ normal: 100, hard: 118, veryhard: 136 }[level] || 100);   // panjang satu ketukan 1/8
+    while (nextT < AC.currentTime + .3) {
+      const i = step % 16;
+      if (BASS[i]) tone(midi(BASS[i]), nextT, dt * .9, 'triangle', .5, musicGain);
+      tone(midi(ARP[i]), nextT, dt * .8, 'square', .12, musicGain);
+      if (i % 2) noise(nextT, .04, .25, musicGain);
+      step++; nextT += dt;
+    }
+  }, 100);
+}
+function musicStop() { clearInterval(musicTimer); musicTimer = 0; }
+
+function applyAudioPrefs() {
+  if (musicGain) musicGain.gain.value = musicOn ? .14 : 0;
+  if (sfxGain) sfxGain.gain.value = sfxOn ? .5 : 0;
+  $('mus-btn').textContent = 'MUSIK: ' + (musicOn ? 'ON' : 'OFF');
+  $('sfx-btn').textContent = 'EFEK: ' + (sfxOn ? 'ON' : 'OFF');
+  $('snd-btn').textContent = musicOn ? '\u266B' : '\u00D7';
+  try { localStorage.setItem('tdMusic', musicOn ? '1' : '0'); localStorage.setItem('tdSfx', sfxOn ? '1' : '0'); } catch (e) {}
+}
+const toggleMusic = () => { musicOn = !musicOn; applyAudioPrefs(); };
+$('mus-btn').addEventListener('click', toggleMusic);
+$('snd-btn').addEventListener('click', toggleMusic);
+$('sfx-btn').addEventListener('click', () => { sfxOn = !sfxOn; applyAudioPrefs(); });
+document.addEventListener('visibilitychange', () => { if (AC) document.hidden ? AC.suspend() : AC.resume(); });   // diam saat pindah tab
+applyAudioPrefs();
+
+/* ===== 12. INIT ===== */
+describe();
+renderLives();
+resize();
+})();
+</script>
+</body>
+</html>
